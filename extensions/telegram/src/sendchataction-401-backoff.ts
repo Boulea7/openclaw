@@ -104,12 +104,14 @@ export function createTelegramSendChatActionHandler({
   let consecutive401Failures = 0;
   let consecutiveTransientFailures = 0;
   let transientCooldownUntil = 0;
+  let lastTransientError: unknown;
   let suspended = false;
 
   const reset = () => {
     consecutive401Failures = 0;
     consecutiveTransientFailures = 0;
     transientCooldownUntil = 0;
+    lastTransientError = undefined;
     suspended = false;
   };
 
@@ -123,7 +125,7 @@ export function createTelegramSendChatActionHandler({
     }
 
     if (transientCooldownUntil > Date.now()) {
-      return;
+      throw lastTransientError;
     }
 
     if (consecutive401Failures > 0) {
@@ -148,11 +150,13 @@ export function createTelegramSendChatActionHandler({
         );
         consecutiveTransientFailures = 0;
         transientCooldownUntil = 0;
+        lastTransientError = undefined;
       }
     } catch (error) {
       if (is401Error(error)) {
         consecutiveTransientFailures = 0;
         transientCooldownUntil = 0;
+        lastTransientError = undefined;
         consecutive401Failures++;
 
         if (consecutive401Failures >= maxConsecutive401) {
@@ -172,13 +176,14 @@ export function createTelegramSendChatActionHandler({
         consecutiveTransientFailures++;
         transientCooldownUntil =
           Date.now() + computeBackoffFn(TRANSIENT_COOLDOWN_POLICY, consecutiveTransientFailures);
+        lastTransientError = error;
         // Typing indicators are best-effort. Once we enter cooldown, skip repeated
-        // sendChatAction calls silently so they do not block message delivery or spam logs.
+        // sendChatAction calls, but keep rejecting so the typing start guard can
+        // count failures and trip its circuit breaker during outages or rate limits.
         logger(
           `sendChatAction transient failure (${consecutiveTransientFailures}). ` +
             `Cooling down before the next retry.`,
         );
-        return;
       }
       throw error;
     }
