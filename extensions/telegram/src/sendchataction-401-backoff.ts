@@ -3,6 +3,10 @@ import {
   sleepWithAbort,
   type BackoffPolicy,
 } from "openclaw/plugin-sdk/infra-runtime";
+import {
+  isRecoverableTelegramNetworkError,
+  isTelegramServerError,
+} from "./network-errors.js";
 
 export type TelegramSendChatActionLogger = (message: string) => void;
 
@@ -52,12 +56,36 @@ const BACKOFF_POLICY: BackoffPolicy = {
   jitter: 0.1,
 };
 
+const TRANSIENT_COOLDOWN_POLICY: BackoffPolicy = {
+  initialMs: 3000,
+  maxMs: 60_000,
+  factor: 2,
+  jitter: 0.1,
+};
+
 function is401Error(error: unknown): boolean {
   if (!error) {
     return false;
   }
   const message = error instanceof Error ? error.message : JSON.stringify(error);
   return message.includes("401") || message.toLowerCase().includes("unauthorized");
+}
+
+function isRateLimitError(error: unknown): boolean {
+  if (!error) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : JSON.stringify(error);
+  const normalized = message.toLowerCase();
+  return normalized.includes("429") || normalized.includes("too many requests");
+}
+
+function isTransientSendChatActionError(error: unknown): boolean {
+  return (
+    isRateLimitError(error) ||
+    isRecoverableTelegramNetworkError(error, { context: "unknown", allowMessageMatch: true }) ||
+    isTelegramServerError(error)
+  );
 }
 
 /**
@@ -75,10 +103,14 @@ export function createTelegramSendChatActionHandler({
   maxConsecutive401 = 10,
 }: CreateTelegramSendChatActionHandlerParams): TelegramSendChatActionHandler {
   let consecutive401Failures = 0;
+  let consecutiveTransientFailures = 0;
+  let transientCooldownUntil = 0;
   let suspended = false;
 
   const reset = () => {
     consecutive401Failures = 0;
+    consecutiveTransientFailures = 0;
+    transientCooldownUntil = 0;
     suspended = false;
   };
 
@@ -88,6 +120,10 @@ export function createTelegramSendChatActionHandler({
     threadParams?: unknown,
   ): Promise<void> => {
     if (suspended) {
+      return;
+    }
+
+    if (transientCooldownUntil > Date.now()) {
       return;
     }
 
@@ -107,8 +143,17 @@ export function createTelegramSendChatActionHandler({
         logger(`sendChatAction recovered after ${consecutive401Failures} consecutive 401 failures`);
         consecutive401Failures = 0;
       }
+      if (consecutiveTransientFailures > 0) {
+        logger(
+          `sendChatAction recovered after ${consecutiveTransientFailures} consecutive transient failures`,
+        );
+        consecutiveTransientFailures = 0;
+        transientCooldownUntil = 0;
+      }
     } catch (error) {
       if (is401Error(error)) {
+        consecutiveTransientFailures = 0;
+        transientCooldownUntil = 0;
         consecutive401Failures++;
 
         if (consecutive401Failures >= maxConsecutive401) {
@@ -124,6 +169,17 @@ export function createTelegramSendChatActionHandler({
               `Retrying with exponential backoff.`,
           );
         }
+      } else if (isTransientSendChatActionError(error)) {
+        consecutiveTransientFailures++;
+        transientCooldownUntil =
+          Date.now() + computeBackoff(TRANSIENT_COOLDOWN_POLICY, consecutiveTransientFailures);
+        // Typing indicators are best-effort. Once we enter cooldown, skip repeated
+        // sendChatAction calls silently so they do not block message delivery or spam logs.
+        logger(
+          `sendChatAction transient failure (${consecutiveTransientFailures}). ` +
+            `Cooling down before the next retry.`,
+        );
+        return;
       }
       throw error;
     }
