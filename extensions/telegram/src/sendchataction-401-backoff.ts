@@ -3,7 +3,11 @@ import {
   sleepWithAbort,
   type BackoffPolicy,
 } from "openclaw/plugin-sdk/infra-runtime";
-import { isRecoverableTelegramNetworkError, isTelegramServerError } from "./network-errors.js";
+import {
+  isRecoverableTelegramNetworkError,
+  isTelegramRateLimitError,
+  isTelegramServerError,
+} from "./network-errors.js";
 
 export type TelegramSendChatActionLogger = (message: string) => void;
 
@@ -72,18 +76,9 @@ function is401Error(error: unknown): boolean {
   return message.includes("401") || message.toLowerCase().includes("unauthorized");
 }
 
-function isRateLimitError(error: unknown): boolean {
-  if (!error) {
-    return false;
-  }
-  const message = error instanceof Error ? error.message : JSON.stringify(error);
-  const normalized = message.toLowerCase();
-  return normalized.includes("429") || normalized.includes("too many requests");
-}
-
 function isTransientSendChatActionError(error: unknown): boolean {
   return (
-    isRateLimitError(error) ||
+    isTelegramRateLimitError(error) ||
     isRecoverableTelegramNetworkError(error, { context: "unknown", allowMessageMatch: true }) ||
     isTelegramServerError(error)
   );
