@@ -3,10 +3,7 @@ import {
   sleepWithAbort,
   type BackoffPolicy,
 } from "openclaw/plugin-sdk/infra-runtime";
-import {
-  isRecoverableTelegramNetworkError,
-  isTelegramServerError,
-} from "./network-errors.js";
+import { isRecoverableTelegramNetworkError, isTelegramServerError } from "./network-errors.js";
 
 export type TelegramSendChatActionLogger = (message: string) => void;
 
@@ -47,6 +44,10 @@ export type CreateTelegramSendChatActionHandlerParams = {
   sendChatActionFn: SendChatActionFn;
   logger: TelegramSendChatActionLogger;
   maxConsecutive401?: number;
+  runtime?: Partial<{
+    computeBackoff: typeof computeBackoff;
+    sleepWithAbort: typeof sleepWithAbort;
+  }>;
 };
 
 const BACKOFF_POLICY: BackoffPolicy = {
@@ -101,7 +102,10 @@ export function createTelegramSendChatActionHandler({
   sendChatActionFn,
   logger,
   maxConsecutive401 = 10,
+  runtime,
 }: CreateTelegramSendChatActionHandlerParams): TelegramSendChatActionHandler {
+  const computeBackoffFn = runtime?.computeBackoff ?? computeBackoff;
+  const sleepWithAbortFn = runtime?.sleepWithAbort ?? sleepWithAbort;
   let consecutive401Failures = 0;
   let consecutiveTransientFailures = 0;
   let transientCooldownUntil = 0;
@@ -128,12 +132,12 @@ export function createTelegramSendChatActionHandler({
     }
 
     if (consecutive401Failures > 0) {
-      const backoffMs = computeBackoff(BACKOFF_POLICY, consecutive401Failures);
+      const backoffMs = computeBackoffFn(BACKOFF_POLICY, consecutive401Failures);
       logger(
         `sendChatAction backoff: waiting ${backoffMs}ms before retry ` +
           `(failure ${consecutive401Failures}/${maxConsecutive401})`,
       );
-      await sleepWithAbort(backoffMs);
+      await sleepWithAbortFn(backoffMs);
     }
 
     try {
@@ -172,7 +176,7 @@ export function createTelegramSendChatActionHandler({
       } else if (isTransientSendChatActionError(error)) {
         consecutiveTransientFailures++;
         transientCooldownUntil =
-          Date.now() + computeBackoff(TRANSIENT_COOLDOWN_POLICY, consecutiveTransientFailures);
+          Date.now() + computeBackoffFn(TRANSIENT_COOLDOWN_POLICY, consecutiveTransientFailures);
         // Typing indicators are best-effort. Once we enter cooldown, skip repeated
         // sendChatAction calls silently so they do not block message delivery or spam logs.
         logger(
